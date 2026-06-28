@@ -1,58 +1,41 @@
 """
-Telegram-бот для выдачи прокси IPRoyal (residential) по странам
-+ админка: добавление/удаление доступа в реальном времени (без перезапуска).
-
-КАК ЭТО РАБОТАЕТ
-  IPRoyal residential использует один общий шлюз (geo.iproyal.com:12321),
-  а страна и сессия задаются ДОПОЛНЕНИЯМИ к паролю:
-      пароль_country-gr_session-XXXX_lifetime-1h
-  Боту не нужен список прокси — он сам собирает нужную строку под страну.
-
-ДОСТУП
-  - Админы (ADMIN_USERNAMES / ADMIN_IDS) — всегда имеют доступ и видят кнопки
-    управления: «Добавить доступ», «Убрать доступ», «Список».
-  - Обычные пользователи добавляются админами через кнопку и хранятся в access.json.
-
-ЗАПУСК
-  pip install aiogram
-  python iproyal_proxy_bot.py
+Telegram-бот для выдачи прокси IPRoyal (residential) по странам.
+Страны: Бельгия, Нидерланды, Греция.
 """
 
 import asyncio
-import json
 import os
 import secrets
+import json
+import requests as req_lib
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
 )
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
 # ─────────────────────────────  НАСТРОЙКИ  ─────────────────────────────
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")  # задаётся в «Переменных окружения» на хостинге
-
-# Хост/порт не секретны и заданы прямо тут. Логин/пароль берутся из
-# переменных окружения хостинга (PROXY_USERNAME / PROXY_PASSWORD).
-PROXY_HOST = "geo.iproyal.com"
-PROXY_PORT = "12321"
-PROXY_USERNAME = os.environ.get("PROXY_USERNAME", "")
-PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD", "")
-
-# "Прилипшая" сессия: один IP держится указанное время (10m, 30m, 1h, 24h ... до 7d).
-# Поставь "" — будет ротация (новый IP на каждый запрос).
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
+PROXY_HOST     = "geo.iproyal.com"
+PROXY_PORT     = "12321"
+PROXY_USERNAME = os.environ["PROXY_USERNAME"]
+PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
 SESSION_LIFETIME = "1h"
 
-# Админы — всегда имеют доступ и могут управлять списком (через кнопки).
-# Ники без @ и маленькими буквами (Telegram их не различает по регистру).
+# Файл доступа — хранится рядом со скриптом, переживает перезапуски бота.
+# При необходимости переопределяй через переменную окружения ACCESS_FILE_PATH.
+ACCESS_FILE = Path(os.environ.get("ACCESS_FILE_PATH", str(Path(__file__).with_name("access.json"))))
+
+# Админы — зашиты в код, не слетают при перезаливке. Всегда имеют доступ + управление.
 ADMIN_USERNAMES: set[str] = {
     "bepowell",
     "trendbee",
@@ -60,62 +43,33 @@ ADMIN_USERNAMES: set[str] = {
     "ashlieq",
     "luparafuck",
 }
-ADMIN_IDS: set[int] = set()   # можно добавить числовые id админов, если нужно
-
-# Файл, куда сохраняется выданный доступ (чтобы переживал перезапуск бота).
-ACCESS_FILE = Path(__file__).with_name("access.json")
+ADMIN_IDS: set[int] = set()
 
 # ─────────────────────────────  СТРАНЫ  ─────────────────────────────
 
 COUNTRIES = {
-    "gr": ("🇬🇷", "Греция"),
-    "nl": ("🇳🇱", "Нидерланды"),
-    "es": ("🇪🇸", "Испания"),
     "be": ("🇧🇪", "Бельгия"),
-    "fr": ("🇫🇷", "Франция"),
+    "nl": ("🇳🇱", "Нидерланды"),
+    "gr": ("🇬🇷", "Греция"),
 }
 
-if not BOT_TOKEN:
-    raise SystemExit("Не задан BOT_TOKEN. Добавь переменную окружения BOT_TOKEN на хостинге.")
-if not PROXY_USERNAME or not PROXY_PASSWORD:
-    print("ВНИМАНИЕ: PROXY_USERNAME/PROXY_PASSWORD не заданы — прокси работать не будут.")
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-
-class AdminFlow(StatesGroup):
-    add = State()
-    remove = State()
-
-
-# ─────────────────────────  ДОСТУП (загрузка/сохранение)  ─────────────────────────
+# ─────────────────────────────  ДОСТУП  ─────────────────────────────
 
 def load_access() -> dict:
-    if ACCESS_FILE.exists():
-        try:
-            data = json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
-            return {
-                "usernames": set(data.get("usernames", [])),
-                "ids": set(int(i) for i in data.get("ids", [])),
-            }
-        except Exception:
-            pass
-    return {"usernames": set(), "ids": set()}
+    try:
+        if ACCESS_FILE.exists():
+            return json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"ids": [], "usernames": []}
 
 
-def save_access() -> None:
-    ACCESS_FILE.write_text(
-        json.dumps(
-            {"usernames": sorted(access["usernames"]), "ids": sorted(access["ids"])},
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-access = load_access()
+def save_access(data: dict) -> None:
+    try:
+        ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        ACCESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[WARN] Не удалось сохранить access.json: {e}")
 
 
 def is_admin(user) -> bool:
@@ -129,107 +83,95 @@ def is_admin(user) -> bool:
 def is_allowed(user) -> bool:
     if is_admin(user):
         return True
-    if user.id in access["ids"]:
+    data = load_access()
+    if user.id in data.get("ids", []):
         return True
-    if user.username and user.username.lower() in access["usernames"]:
+    if user.username and user.username.lower() in [u.lower() for u in data.get("usernames", [])]:
         return True
     return False
 
-
-def parse_target(text: str):
-    """'123456' -> ('id', 123456);  '@vasya'/'vasya' -> ('username', 'vasya');  иначе None."""
-    text = (text or "").strip()
-    if not text or text.startswith("/"):
-        return None
-    if text.lstrip("-").isdigit():
-        return ("id", int(text))
-    uname = text.lstrip("@").lower()
-    return ("username", uname) if uname else None
-
-
-def access_list_text() -> str:
-    admins = ", ".join("@" + u for u in sorted(ADMIN_USERNAMES))
-    unames = ", ".join("@" + u for u in sorted(access["usernames"])) or "—"
-    ids = ", ".join(str(i) for i in sorted(access["ids"])) or "—"
-    return (
-        f"<b>👑 Админы:</b> {admins}\n\n"
-        f"<b>✅ Доступ по нику:</b> {unames}\n"
-        f"<b>✅ Доступ по id:</b> {ids}"
-    )
-
-
-# ─────────────────────────────  КЛАВИАТУРЫ  ─────────────────────────────
-
-def main_keyboard(user) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text=f"{flag} {name}", callback_data=f"country:{code}")]
-        for code, (flag, name) in COUNTRIES.items()
-    ]
-    if is_admin(user):
-        rows.append([
-            InlineKeyboardButton(text="➕ Добавить доступ", callback_data="admin:add"),
-            InlineKeyboardButton(text="➖ Убрать доступ", callback_data="admin:remove"),
-        ])
-        rows.append([InlineKeyboardButton(text="👥 Список доступа", callback_data="admin:list")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def cancel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✖️ Отмена", callback_data="admin:cancel")]
-    ])
-
-
 # ─────────────────────────────  ПРОКСИ  ─────────────────────────────
 
-def build_proxy(code: str) -> str:
-    session = secrets.token_hex(4)  # уникальный ID сессии → отдельный IP
+def build_proxy_string(code: str) -> str:
+    session  = secrets.token_hex(4)
     password = f"{PROXY_PASSWORD}_country-{code}_session-{session}"
     if SESSION_LIFETIME:
         password += f"_lifetime-{SESSION_LIFETIME}"
     return f"{PROXY_HOST}:{PROXY_PORT}:{PROXY_USERNAME}:{password}"
 
 
-def proxy_message(code: str, user) -> tuple[str, InlineKeyboardMarkup]:
-    flag, name = COUNTRIES[code]
-    line = build_proxy(code)
-    host, port, usr, pwd = line.split(":", 3)
-    url = f"http://{usr}:{pwd}@{host}:{port}"
-    text = (
-        f"{flag} <b>{name}</b>\n\n"
-        f"<b>HOST:PORT:USER:PASS</b>\n<code>{line}</code>\n\n"
-        f"<b>URL</b>\n<code>{url}</code>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Другой IP", callback_data=f"country:{code}")],
+def check_proxy(proxy_str: str) -> tuple[bool, str]:
+    """Проверяет прокси реальным запросом. Возвращает (живой, внешний_IP)."""
+    host, port, user, pwd = proxy_str.split(":", 3)
+    proxy_url = f"http://{user}:{pwd}@{host}:{port}"
+    proxies   = {"http": proxy_url, "https": proxy_url}
+    try:
+        r  = req_lib.get("https://api.ipify.org?format=json", proxies=proxies, timeout=12)
+        ip = r.json().get("ip", "?")
+        return True, ip
+    except Exception:
+        return False, ""
+
+# ─────────────────────────────  КЛАВИАТУРЫ  ─────────────────────────────
+
+def countries_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"{flag} {name}", callback_data=f"country:{code}")]
+        for code, (flag, name) in COUNTRIES.items()
+    ]
+    if admin:
+        rows += [
+            [InlineKeyboardButton(text="➕ Добавить доступ", callback_data="add_access")],
+            [InlineKeyboardButton(text="➖ Убрать доступ",  callback_data="remove_access")],
+            [InlineKeyboardButton(text="👥 Список доступа", callback_data="list_access")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✖️ Отмена", callback_data="back")]
+    ])
+
+
+def proxy_result_kb(code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Другой IP",         callback_data=f"country:{code}")],
         [InlineKeyboardButton(text="⬅️ К списку стран", callback_data="back")],
     ])
-    return text, kb
 
+# ─────────────────────────────  FSM  ─────────────────────────────
 
-# ─────────────────────────────  ХЭНДЛЕРЫ  ─────────────────────────────
+class AdminFlow(StatesGroup):
+    waiting_add    = State()
+    waiting_remove = State()
+
+# ─────────────────────────────  БОТ  ─────────────────────────────
+
+bot = Bot(token=BOT_TOKEN)
+dp  = Dispatcher(storage=MemoryStorage())
+
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
+async def cmd_start(message: Message):
     if not is_allowed(message.from_user):
         await message.answer("⛔ Доступ к боту ограничен.")
         return
-    await message.answer("Выбери страну прокси:", reply_markup=main_keyboard(message.from_user))
+    await message.answer("Выбери страну прокси:", reply_markup=countries_keyboard(is_admin(message.from_user)))
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
-    if await state.get_state() is not None:
-        await state.clear()
-        await message.answer("Отменено.", reply_markup=main_keyboard(message.from_user))
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=countries_keyboard(is_admin(message.from_user)))
 
 
 @dp.callback_query(F.data == "back")
 async def cb_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
-        "Выбери страну прокси:", reply_markup=main_keyboard(callback.from_user)
+        "Выбери страну прокси:",
+        reply_markup=countries_keyboard(is_admin(callback.from_user))
     )
     await callback.answer()
 
@@ -239,110 +181,156 @@ async def cb_country(callback: CallbackQuery):
     if not is_allowed(callback.from_user):
         await callback.answer("⛔ Доступ ограничен.", show_alert=True)
         return
+
     code = callback.data.split(":", 1)[1]
     if code not in COUNTRIES:
         await callback.answer("Неизвестная страна.", show_alert=True)
         return
-    text, kb = proxy_message(code, callback.from_user)
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await callback.answer("Готово ✅")
 
+    flag, name = COUNTRIES[code]
 
-@dp.callback_query(F.data == "admin:cancel")
-async def cb_admin_cancel(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
+    # Промежуточное сообщение пока идёт проверка
     await callback.message.edit_text(
-        "Выбери страну прокси:", reply_markup=main_keyboard(callback.from_user)
+        f"{flag} <b>{name}</b>\n\n⏳ Получаю прокси и проверяю...",
+        parse_mode="HTML"
     )
-    await callback.answer("Отменено")
 
+    proxy_str       = build_proxy_string(code)
+    alive, real_ip  = check_proxy(proxy_str)
 
-@dp.callback_query(F.data == "admin:list")
-async def cb_admin_list(callback: CallbackQuery):
-    if not is_admin(callback.from_user):
-        await callback.answer("⛔ Только для админов.", show_alert=True)
-        return
-    await callback.message.answer(access_list_text(), parse_mode="HTML")
-    await callback.answer()
+    host, port, user, pwd = proxy_str.split(":", 3)
+    url = f"http://{user}:{pwd}@{host}:{port}"
 
-
-@dp.callback_query(F.data == "admin:add")
-async def cb_admin_add(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user):
-        await callback.answer("⛔ Только для админов.", show_alert=True)
-        return
-    await state.set_state(AdminFlow.add)
-    await callback.message.answer(
-        "Кому дать доступ? Пришли <b>id</b> или <b>@username</b> одним сообщением.",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard(),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin:remove")
-async def cb_admin_remove(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user):
-        await callback.answer("⛔ Только для админов.", show_alert=True)
-        return
-    await state.set_state(AdminFlow.remove)
-    await callback.message.answer(
-        "У кого убрать доступ? Пришли <b>id</b> или <b>@username</b> одним сообщением.",
-        parse_mode="HTML",
-        reply_markup=cancel_keyboard(),
-    )
-    await callback.answer()
-
-
-@dp.message(AdminFlow.add)
-async def process_add(message: Message, state: FSMContext):
-    if not is_admin(message.from_user):
-        await state.clear()
-        return
-    target = parse_target(message.text)
-    if target is None:
-        await message.answer("Не понял. Пришли id (число) или @username, либо нажми «Отмена».")
-        return
-    kind, value = target
-    if kind == "id":
-        access["ids"].add(value)
-        label = str(value)
+    if alive:
+        status      = f"✅ Живой · IP: <code>{real_ip}</code>"
+        answer_text = "Готово ✅"
     else:
-        access["usernames"].add(value)
-        label = "@" + value
-    save_access()
+        status      = "⚠️ Прокси не ответил — нажми 🔄 Другой IP"
+        answer_text = "⚠️ Нет ответа"
+
+    text = (
+        f"{flag} <b>{name}</b>\n"
+        f"{status}\n\n"
+        f"<b>HOST:PORT:USER:PASS</b>\n<code>{proxy_str}</code>\n\n"
+        f"<b>URL</b>\n<code>{url}</code>"
+    )
+    await callback.message.edit_text(text, reply_markup=proxy_result_kb(code), parse_mode="HTML")
+    await callback.answer(answer_text)
+
+
+# ── Добавить доступ ──────────────────────────────────────────────
+
+@dp.callback_query(F.data == "add_access")
+async def cb_add_access(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_add)
+    await callback.message.edit_text(
+        "Кому дать доступ?\nОтправь числовой ID или @username.",
+        reply_markup=cancel_kb()
+    )
+    await callback.answer()
+
+
+@dp.message(AdminFlow.waiting_add)
+async def msg_add_access(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer(f"✅ Доступ выдан: {label}", reply_markup=main_keyboard(message.from_user))
+    raw  = message.text.strip().lstrip("@")
+    data = load_access()
 
-
-@dp.message(AdminFlow.remove)
-async def process_remove(message: Message, state: FSMContext):
-    if not is_admin(message.from_user):
-        await state.clear()
-        return
-    target = parse_target(message.text)
-    if target is None:
-        await message.answer("Не понял. Пришли id (число) или @username, либо нажми «Отмена».")
-        return
-    kind, value = target
-    if kind == "id":
-        existed = value in access["ids"]
-        access["ids"].discard(value)
-        label = str(value)
+    if raw.isdigit():
+        uid = int(raw)
+        if uid not in data["ids"]:
+            data["ids"].append(uid)
+            save_access(data)
+            await message.answer(f"✅ Доступ выдан: <code>{uid}</code>",
+                                  parse_mode="HTML", reply_markup=countries_keyboard(True))
+        else:
+            await message.answer("Этот ID уже есть.", reply_markup=countries_keyboard(True))
     else:
-        existed = value in access["usernames"]
-        access["usernames"].discard(value)
-        label = "@" + value
-    save_access()
-    await state.clear()
-    msg = f"🗑 Доступ убран: {label}" if existed else f"ℹ️ {label} и так не было в списке."
-    await message.answer(msg, reply_markup=main_keyboard(message.from_user))
+        uname = raw.lower()
+        if uname not in [u.lower() for u in data["usernames"]]:
+            data["usernames"].append(uname)
+            save_access(data)
+            await message.answer(f"✅ Доступ выдан: @{uname}", reply_markup=countries_keyboard(True))
+        else:
+            await message.answer("Этот username уже есть.", reply_markup=countries_keyboard(True))
 
+
+# ── Убрать доступ ────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "remove_access")
+async def cb_remove_access(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    await state.set_state(AdminFlow.waiting_remove)
+    await callback.message.edit_text(
+        "Кого убрать?\nОтправь числовой ID или @username.",
+        reply_markup=cancel_kb()
+    )
+    await callback.answer()
+
+
+@dp.message(AdminFlow.waiting_remove)
+async def msg_remove_access(message: Message, state: FSMContext):
+    await state.clear()
+    raw  = message.text.strip().lstrip("@")
+    data = load_access()
+
+    if raw.isdigit():
+        uid = int(raw)
+        if uid in data["ids"]:
+            data["ids"].remove(uid)
+            save_access(data)
+            await message.answer(f"✅ Убран: <code>{uid}</code>",
+                                  parse_mode="HTML", reply_markup=countries_keyboard(True))
+        else:
+            await message.answer("Такого ID нет.", reply_markup=countries_keyboard(True))
+    else:
+        uname = raw.lower()
+        if uname in [u.lower() for u in data["usernames"]]:
+            data["usernames"] = [u for u in data["usernames"] if u.lower() != uname]
+            save_access(data)
+            await message.answer(f"✅ Убран: @{uname}", reply_markup=countries_keyboard(True))
+        else:
+            await message.answer("Такого username нет.", reply_markup=countries_keyboard(True))
+
+
+# ── Список доступа ───────────────────────────────────────────────
+
+@dp.callback_query(F.data == "list_access")
+async def cb_list_access(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    data      = load_access()
+    ids       = data.get("ids", [])
+    usernames = data.get("usernames", [])
+
+    lines = ["👥 <b>Список доступа</b>\n"]
+    if ids:
+        lines.append("<b>По ID:</b>")
+        lines += [f"  • <code>{uid}</code>" for uid in ids]
+    if usernames:
+        lines.append("\n<b>По username:</b>")
+        lines += [f"  • @{u}" for u in usernames]
+    if not ids and not usernames:
+        lines.append("Список пуст.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
+    ])
+    await callback.message.edit_text("\n".join(lines), reply_markup=kb, parse_mode="HTML")
+    await callback.answer()
+
+
+# ─────────────────────────────  ЗАПУСК  ─────────────────────────────
 
 async def main():
     print("Бот запущен...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
