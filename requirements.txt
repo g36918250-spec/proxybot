@@ -1,2 +1,2 @@
 aiogram
-requests
+requests[socks]
