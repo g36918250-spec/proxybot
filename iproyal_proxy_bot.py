@@ -26,7 +26,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 BOT_TOKEN      = os.environ["BOT_TOKEN"]
 PROXY_HOST     = "geo.iproyal.com"
-PROXY_PORT     = "12321"
+PROXY_PORT     = "32325"
 PROXY_USERNAME = os.environ["PROXY_USERNAME"]
 PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
 SESSION_LIFETIME = "1h"
@@ -103,8 +103,8 @@ def build_proxy_string(code: str) -> str:
 def check_proxy(proxy_str: str) -> tuple[bool, str]:
     """Проверяет прокси реальным запросом. Возвращает (живой, внешний_IP)."""
     host, port, user, pwd = proxy_str.split(":", 3)
-    proxy_url = f"http://{user}:{pwd}@{host}:{port}"
-    proxies   = {"http": proxy_url, "https": proxy_url}
+    proxy_url = f"socks5://{user}:{pwd}@{host}:{port}"
+    proxies   = {"http": proxy_url, "https": proxy_url, "socks5": proxy_url}
     try:
         r  = req_lib.get("https://api.ipify.org?format=json", proxies=proxies, timeout=12)
         ip = r.json().get("ip", "?")
@@ -199,7 +199,7 @@ async def cb_country(callback: CallbackQuery):
     alive, real_ip  = check_proxy(proxy_str)
 
     host, port, user, pwd = proxy_str.split(":", 3)
-    url = f"http://{user}:{pwd}@{host}:{port}"
+    url = f"socks5://{user}:{pwd}@{host}:{port}"
 
     if alive:
         status      = f"✅ Живой · IP: <code>{real_ip}</code>"
