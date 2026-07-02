@@ -1,26 +1,32 @@
 """
 Telegram-бот для выдачи прокси IPRoyal (residential) по странам.
 Страны: Бельгия, Нидерланды, Греция.
+
+Персистентность доступа: access.json хранится в GitHub-репозитории.
+При добавлении/удалении людей бот коммитит изменения прямо в репо.
+Нужны переменные окружения GITHUB_TOKEN и GITHUB_REPO.
 """
 
 import asyncio
+import base64
+import json
 import os
 import secrets
-import json
-import requests as req_lib
 from pathlib import Path
 
+import requests as req_lib
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
 # ─────────────────────────────  НАСТРОЙКИ  ─────────────────────────────
 
@@ -31,17 +37,19 @@ PROXY_USERNAME = os.environ["PROXY_USERNAME"]
 PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
 SESSION_LIFETIME = "1h"
 
-# Файл доступа — хранится рядом со скриптом, переживает перезапуски бота.
-# При необходимости переопределяй через переменную окружения ACCESS_FILE_PATH.
+# GitHub — бот читает и пишет access.json прямо в репозиторий.
+# Добавь GITHUB_TOKEN и GITHUB_REPO в переменные окружения на bothost.
+GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO        = os.environ.get("GITHUB_REPO", "")   # g36918250-spec/proxybot
+GITHUB_BRANCH      = os.environ.get("GITHUB_BRANCH", "main")
+GITHUB_ACCESS_PATH = "access.json"
+
+# Локальный fallback (если GitHub не настроен)
 ACCESS_FILE = Path(os.environ.get("ACCESS_FILE_PATH", str(Path(__file__).with_name("access.json"))))
 
-# Админы — зашиты в код, не слетают при перезаливке. Всегда имеют доступ + управление.
+# Админы — зашиты в код, никогда не слетают.
 ADMIN_USERNAMES: set[str] = {
-    "bepowell",
-    "trendbee",
-    "patumkin",
-    "ashlieq",
-    "luparafuck",
+    "bepowell", "trendbee", "patumkin", "ashlieq", "luparafuck",
 }
 ADMIN_IDS: set[int] = set()
 
@@ -53,9 +61,29 @@ COUNTRIES = {
     "gr": ("🇬🇷", "Греция"),
 }
 
-# ─────────────────────────────  ДОСТУП  ─────────────────────────────
+# ─────────────────────────────  GITHUB  ─────────────────────────────
+
+def _gh_headers() -> dict:
+    return {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
 
 def load_access() -> dict:
+    """Загружает список доступа из GitHub (приоритет) или локального файла."""
+    if GITHUB_TOKEN and GITHUB_REPO:
+        try:
+            r = req_lib.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_ACCESS_PATH}",
+                headers=_gh_headers(), timeout=10,
+            )
+            if r.status_code == 200:
+                content = base64.b64decode(r.json()["content"]).decode("utf-8")
+                return json.loads(content)
+        except Exception as e:
+            print(f"[WARN] GitHub load error: {e}")
+
     try:
         if ACCESS_FILE.exists():
             return json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
@@ -65,12 +93,41 @@ def load_access() -> dict:
 
 
 def save_access(data: dict) -> None:
+    """Сохраняет список доступа в GitHub и локально."""
+    # Локальный файл (fallback)
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
         ACCESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
-        print(f"[WARN] Не удалось сохранить access.json: {e}")
+        print(f"[WARN] Local save error: {e}")
 
+    # GitHub — основное хранилище
+    if GITHUB_TOKEN and GITHUB_REPO:
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_ACCESS_PATH}"
+            r   = req_lib.get(url, headers=_gh_headers(), timeout=10)
+            sha = r.json().get("sha") if r.status_code == 200 else None
+
+            encoded = base64.b64encode(
+                json.dumps(data, ensure_ascii=False, indent=2).encode()
+            ).decode()
+            payload: dict = {
+                "message": "bot: обновление доступа",
+                "content": encoded,
+                "branch":  GITHUB_BRANCH,
+            }
+            if sha:
+                payload["sha"] = sha
+
+            result = req_lib.put(url, headers=_gh_headers(), json=payload, timeout=15)
+            if result.status_code in (200, 201):
+                print("[INFO] access.json → GitHub ✓")
+            else:
+                print(f"[WARN] GitHub save {result.status_code}: {result.text[:200]}")
+        except Exception as e:
+            print(f"[WARN] GitHub save error: {e}")
+
+# ─────────────────────────────  ДОСТУП  ─────────────────────────────
 
 def is_admin(user) -> bool:
     if user.id in ADMIN_IDS:
@@ -101,10 +158,10 @@ def build_proxy_string(code: str) -> str:
 
 
 def check_proxy(proxy_str: str) -> tuple[bool, str]:
-    """Проверяет прокси реальным запросом. Возвращает (живой, внешний_IP)."""
+    """Проверяет прокси реальным запросом через SOCKS5."""
     host, port, user, pwd = proxy_str.split(":", 3)
     proxy_url = f"socks5://{user}:{pwd}@{host}:{port}"
-    proxies   = {"http": proxy_url, "https": proxy_url, "socks5": proxy_url}
+    proxies   = {"http": proxy_url, "https": proxy_url}
     try:
         r  = req_lib.get("https://api.ipify.org?format=json", proxies=proxies, timeout=12)
         ip = r.json().get("ip", "?")
@@ -122,8 +179,8 @@ def countries_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
     if admin:
         rows += [
             [InlineKeyboardButton(text="➕ Добавить доступ", callback_data="add_access")],
-            [InlineKeyboardButton(text="➖ Убрать доступ",  callback_data="remove_access")],
-            [InlineKeyboardButton(text="👥 Список доступа", callback_data="list_access")],
+            [InlineKeyboardButton(text="➖ Убрать доступ",   callback_data="remove_access")],
+            [InlineKeyboardButton(text="👥 Список доступа",  callback_data="list_access")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -136,8 +193,8 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 def proxy_result_kb(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Другой IP",         callback_data=f"country:{code}")],
-        [InlineKeyboardButton(text="⬅️ К списку стран", callback_data="back")],
+        [InlineKeyboardButton(text="🔄 Другой IP",        callback_data=f"country:{code}")],
+        [InlineKeyboardButton(text="⬅️ К списку стран",  callback_data="back")],
     ])
 
 # ─────────────────────────────  FSM  ─────────────────────────────
@@ -157,7 +214,10 @@ async def cmd_start(message: Message):
     if not is_allowed(message.from_user):
         await message.answer("⛔ Доступ к боту ограничен.")
         return
-    await message.answer("Выбери страну прокси:", reply_markup=countries_keyboard(is_admin(message.from_user)))
+    await message.answer(
+        "Выбери страну прокси:",
+        reply_markup=countries_keyboard(is_admin(message.from_user))
+    )
 
 
 @dp.message(Command("cancel"))
@@ -188,25 +248,19 @@ async def cb_country(callback: CallbackQuery):
         return
 
     flag, name = COUNTRIES[code]
-
-    # Промежуточное сообщение пока идёт проверка
     await callback.message.edit_text(
         f"{flag} <b>{name}</b>\n\n⏳ Получаю прокси и проверяю...",
         parse_mode="HTML"
     )
 
-    proxy_str       = build_proxy_string(code)
-    alive, real_ip  = check_proxy(proxy_str)
+    proxy_str      = build_proxy_string(code)
+    alive, real_ip = check_proxy(proxy_str)
 
     host, port, user, pwd = proxy_str.split(":", 3)
     url = f"socks5://{user}:{pwd}@{host}:{port}"
 
-    if alive:
-        status      = f"✅ Живой · IP: <code>{real_ip}</code>"
-        answer_text = "Готово ✅"
-    else:
-        status      = "⚠️ Прокси не ответил — нажми 🔄 Другой IP"
-        answer_text = "⚠️ Нет ответа"
+    status      = f"✅ Живой · IP: <code>{real_ip}</code>" if alive else "⚠️ Прокси не ответил — нажми 🔄 Другой IP"
+    answer_text = "Готово ✅" if alive else "⚠️ Нет ответа"
 
     text = (
         f"{flag} <b>{name}</b>\n"
@@ -227,7 +281,10 @@ async def cb_add_access(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminFlow.waiting_add)
     await callback.message.edit_text(
-        "Кому дать доступ?\nОтправь числовой ID или @username.",
+        "Кому дать доступ?\n"
+        "Можно сразу несколько через запятую:\n"
+        "<code>@username1, 123456789, username2</code>",
+        parse_mode="HTML",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -236,26 +293,41 @@ async def cb_add_access(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminFlow.waiting_add)
 async def msg_add_access(message: Message, state: FSMContext):
     await state.clear()
-    raw  = message.text.strip().lstrip("@")
-    data = load_access()
+    entries          = [e.strip().lstrip("@") for e in message.text.split(",")]
+    data             = load_access()
+    added, already   = [], []
 
-    if raw.isdigit():
-        uid = int(raw)
-        if uid not in data["ids"]:
-            data["ids"].append(uid)
-            save_access(data)
-            await message.answer(f"✅ Доступ выдан: <code>{uid}</code>",
-                                  parse_mode="HTML", reply_markup=countries_keyboard(True))
+    for raw in entries:
+        if not raw:
+            continue
+        if raw.isdigit():
+            uid = int(raw)
+            if uid not in data["ids"]:
+                data["ids"].append(uid)
+                added.append(f"<code>{uid}</code>")
+            else:
+                already.append(f"<code>{uid}</code>")
         else:
-            await message.answer("Этот ID уже есть.", reply_markup=countries_keyboard(True))
-    else:
-        uname = raw.lower()
-        if uname not in [u.lower() for u in data["usernames"]]:
-            data["usernames"].append(uname)
-            save_access(data)
-            await message.answer(f"✅ Доступ выдан: @{uname}", reply_markup=countries_keyboard(True))
-        else:
-            await message.answer("Этот username уже есть.", reply_markup=countries_keyboard(True))
+            uname = raw.lower()
+            if uname not in [u.lower() for u in data["usernames"]]:
+                data["usernames"].append(uname)
+                added.append(f"@{uname}")
+            else:
+                already.append(f"@{uname}")
+
+    if added:
+        save_access(data)
+
+    lines = []
+    if added:
+        lines.append(f"✅ Добавлены: {', '.join(added)}")
+    if already:
+        lines.append(f"Уже были: {', '.join(already)}")
+    await message.answer(
+        "\n".join(lines) or "Никого не добавлено.",
+        parse_mode="HTML",
+        reply_markup=countries_keyboard(True)
+    )
 
 
 # ── Убрать доступ ────────────────────────────────────────────────
@@ -267,7 +339,10 @@ async def cb_remove_access(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminFlow.waiting_remove)
     await callback.message.edit_text(
-        "Кого убрать?\nОтправь числовой ID или @username.",
+        "Кого убрать?\n"
+        "Можно несколько через запятую:\n"
+        "<code>@username1, 123456789</code>",
+        parse_mode="HTML",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -276,26 +351,41 @@ async def cb_remove_access(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminFlow.waiting_remove)
 async def msg_remove_access(message: Message, state: FSMContext):
     await state.clear()
-    raw  = message.text.strip().lstrip("@")
-    data = load_access()
+    entries              = [e.strip().lstrip("@") for e in message.text.split(",")]
+    data                 = load_access()
+    removed, not_found   = [], []
 
-    if raw.isdigit():
-        uid = int(raw)
-        if uid in data["ids"]:
-            data["ids"].remove(uid)
-            save_access(data)
-            await message.answer(f"✅ Убран: <code>{uid}</code>",
-                                  parse_mode="HTML", reply_markup=countries_keyboard(True))
+    for raw in entries:
+        if not raw:
+            continue
+        if raw.isdigit():
+            uid = int(raw)
+            if uid in data["ids"]:
+                data["ids"].remove(uid)
+                removed.append(f"<code>{uid}</code>")
+            else:
+                not_found.append(f"<code>{uid}</code>")
         else:
-            await message.answer("Такого ID нет.", reply_markup=countries_keyboard(True))
-    else:
-        uname = raw.lower()
-        if uname in [u.lower() for u in data["usernames"]]:
-            data["usernames"] = [u for u in data["usernames"] if u.lower() != uname]
-            save_access(data)
-            await message.answer(f"✅ Убран: @{uname}", reply_markup=countries_keyboard(True))
-        else:
-            await message.answer("Такого username нет.", reply_markup=countries_keyboard(True))
+            uname = raw.lower()
+            if uname in [u.lower() for u in data["usernames"]]:
+                data["usernames"] = [u for u in data["usernames"] if u.lower() != uname]
+                removed.append(f"@{uname}")
+            else:
+                not_found.append(f"@{uname}")
+
+    if removed:
+        save_access(data)
+
+    lines = []
+    if removed:
+        lines.append(f"✅ Убраны: {', '.join(removed)}")
+    if not_found:
+        lines.append(f"Не найдены: {', '.join(not_found)}")
+    await message.answer(
+        "\n".join(lines) or "Никого не убрано.",
+        parse_mode="HTML",
+        reply_markup=countries_keyboard(True)
+    )
 
 
 # ── Список доступа ───────────────────────────────────────────────
