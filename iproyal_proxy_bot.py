@@ -53,6 +53,15 @@ ADMIN_USERNAMES: set[str] = {
 }
 ADMIN_IDS: set[int] = set()
 
+# Сколько прокси выдавать — хранится в памяти, сбрасывается к 1 при перезапуске.
+user_proxy_count: dict[int, int] = {}
+
+def get_user_count(user_id: int) -> int:
+    return user_proxy_count.get(user_id, 1)
+
+def set_user_count(user_id: int, count: int) -> None:
+    user_proxy_count[user_id] = count
+
 # ─────────────────────────────  СТРАНЫ  ─────────────────────────────
 
 COUNTRIES = {
@@ -170,13 +179,21 @@ def check_proxy(proxy_str: str) -> tuple[bool, str]:
     except Exception:
         return False, ""
 
+
+async def check_proxy_async(proxy_str: str) -> tuple[bool, str]:
+    """Асинхронная обёртка — запускает проверку в отдельном потоке."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, check_proxy, proxy_str)
+
 # ─────────────────────────────  КЛАВИАТУРЫ  ─────────────────────────────
 
-def countries_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
+def countries_keyboard(admin: bool = False, user_id: int = 0) -> InlineKeyboardMarkup:
+    count = get_user_count(user_id)
     rows = [
         [InlineKeyboardButton(text=f"{flag} {name}", callback_data=f"country:{code}")]
         for code, (flag, name) in COUNTRIES.items()
     ]
+    rows.append([InlineKeyboardButton(text=f"🔢 Количество прокси: {count}", callback_data="count_menu")])
     if admin:
         rows += [
             [InlineKeyboardButton(text="➕ Добавить доступ", callback_data="add_access")],
@@ -184,6 +201,13 @@ def countries_keyboard(admin: bool = False) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="👥 Список доступа",  callback_data="list_access")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def count_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=str(i), callback_data=f"set_count:{i}") for i in range(1, 6)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
+    ])
 
 
 def cancel_kb() -> InlineKeyboardMarkup:
@@ -215,26 +239,56 @@ async def cmd_start(message: Message):
     if not is_allowed(message.from_user):
         await message.answer("⛔ Доступ к боту ограничен.")
         return
+    uid = message.from_user.id
     await message.answer(
         "Выбери страну прокси:",
-        reply_markup=countries_keyboard(is_admin(message.from_user))
+        reply_markup=countries_keyboard(is_admin(message.from_user), uid)
     )
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Отменено.", reply_markup=countries_keyboard(is_admin(message.from_user)))
+    uid = message.from_user.id
+    await message.answer("Отменено.", reply_markup=countries_keyboard(is_admin(message.from_user), uid))
 
 
 @dp.callback_query(F.data == "back")
 async def cb_back(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    uid = callback.from_user.id
     await callback.message.edit_text(
         "Выбери страну прокси:",
-        reply_markup=countries_keyboard(is_admin(callback.from_user))
+        reply_markup=countries_keyboard(is_admin(callback.from_user), uid)
     )
     await callback.answer()
+
+
+@dp.callback_query(F.data == "count_menu")
+async def cb_count_menu(callback: CallbackQuery):
+    if not is_allowed(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "Выбери количество прокси за один запрос:",
+        reply_markup=count_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("set_count:"))
+async def cb_set_count(callback: CallbackQuery):
+    if not is_allowed(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    count = int(callback.data.split(":")[1])
+    uid   = callback.from_user.id
+    set_user_count(uid, count)
+    await callback.message.edit_text(
+        "Выбери страну прокси:",
+        reply_markup=countries_keyboard(is_admin(callback.from_user), uid)
+    )
+    await callback.answer(f"✅ Теперь выдаётся {count} шт.")
 
 
 @dp.callback_query(F.data.startswith("country:"))
@@ -248,27 +302,49 @@ async def cb_country(callback: CallbackQuery):
         await callback.answer("Неизвестная страна.", show_alert=True)
         return
 
+    uid        = callback.from_user.id
+    count      = get_user_count(uid)
     flag, name = COUNTRIES[code]
+    label      = f"{flag} <b>{name}</b>" + (f" · {count} шт." if count > 1 else "")
+
     await callback.message.edit_text(
-        f"{flag} <b>{name}</b>\n\n⏳ Получаю прокси и проверяю...",
+        f"{label}\n\n⏳ Получаю прокси и проверяю...",
         parse_mode="HTML"
     )
 
-    proxy_str      = build_proxy_string(code)
-    alive, real_ip = check_proxy(proxy_str)
+    # Генерируем N прокси и проверяем их параллельно
+    proxy_list = [build_proxy_string(code) for _ in range(count)]
+    results    = await asyncio.gather(*[check_proxy_async(p) for p in proxy_list])
 
-    host, port, user, pwd = proxy_str.split(":", 3)
-    url = f"socks5://{user}:{pwd}@{host}:{port}"
+    if count == 1:
+        proxy_str      = proxy_list[0]
+        alive, real_ip = results[0]
+        host, port, user, pwd = proxy_str.split(":", 3)
+        url    = f"socks5://{user}:{pwd}@{host}:{port}"
+        status = f"✅ Живой · IP: <code>{real_ip}</code>" if alive else "⚠️ Прокси не ответил — нажми 🔄 Другой IP"
+        text   = (
+            f"{label}\n{status}\n\n"
+            f"<b>HOST:PORT:USER:PASS</b>\n<code>{proxy_str}</code>\n\n"
+            f"<b>URL</b>\n<code>{url}</code>"
+        )
+        answer_text = "Готово ✅" if alive else "⚠️ Нет ответа"
+    else:
+        lines = [label + "\n"]
+        alive_count = 0
+        for i, (proxy_str, (alive, real_ip)) in enumerate(zip(proxy_list, results), 1):
+            host, port, user, pwd = proxy_str.split(":", 3)
+            url    = f"socks5://{user}:{pwd}@{host}:{port}"
+            status = f"✅ {real_ip}" if alive else "⚠️ нет ответа"
+            if alive:
+                alive_count += 1
+            lines.append(
+                f"<b>{i}.</b> {status}\n"
+                f"<code>{proxy_str}</code>\n"
+                f"<code>{url}</code>"
+            )
+        text        = "\n".join(lines)
+        answer_text = f"✅ Живых: {alive_count}/{count}"
 
-    status      = f"✅ Живой · IP: <code>{real_ip}</code>" if alive else "⚠️ Прокси не ответил — нажми 🔄 Другой IP"
-    answer_text = "Готово ✅" if alive else "⚠️ Нет ответа"
-
-    text = (
-        f"{flag} <b>{name}</b>\n"
-        f"{status}\n\n"
-        f"<b>HOST:PORT:USER:PASS</b>\n<code>{proxy_str}</code>\n\n"
-        f"<b>URL</b>\n<code>{url}</code>"
-    )
     await callback.message.edit_text(text, reply_markup=proxy_result_kb(code), parse_mode="HTML")
     await callback.answer(answer_text)
 
@@ -327,7 +403,7 @@ async def msg_add_access(message: Message, state: FSMContext):
     await message.answer(
         "\n".join(lines) or "Никого не добавлено.",
         parse_mode="HTML",
-        reply_markup=countries_keyboard(True)
+        reply_markup=countries_keyboard(True, message.from_user.id)
     )
 
 
@@ -385,7 +461,7 @@ async def msg_remove_access(message: Message, state: FSMContext):
     await message.answer(
         "\n".join(lines) or "Никого не убрано.",
         parse_mode="HTML",
-        reply_markup=countries_keyboard(True)
+        reply_markup=countries_keyboard(True, message.from_user.id)
     )
 
 
