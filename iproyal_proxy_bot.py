@@ -168,12 +168,12 @@ def build_proxy_string(code: str) -> str:
 
 
 def check_proxy(proxy_str: str) -> tuple[bool, str]:
-    """Проверяет прокси реальным запросом через SOCKS5."""
+    """Проверяет прокси через SOCKS5. Таймаут 2 сек."""
     host, port, user, pwd = proxy_str.split(":", 3)
     proxy_url = f"socks5://{user}:{pwd}@{host}:{port}"
     proxies   = {"http": proxy_url, "https": proxy_url}
     try:
-        r  = req_lib.get("https://api.ipify.org?format=json", proxies=proxies, timeout=12)
+        r  = req_lib.get("https://api.ipify.org?format=json", proxies=proxies, timeout=2)
         ip = r.json().get("ip", "?")
         return True, ip
     except Exception:
@@ -181,9 +181,24 @@ def check_proxy(proxy_str: str) -> tuple[bool, str]:
 
 
 async def check_proxy_async(proxy_str: str) -> tuple[bool, str]:
-    """Асинхронная обёртка — запускает проверку в отдельном потоке."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, check_proxy, proxy_str)
+
+
+async def collect_working_proxies(code: str, needed: int) -> list[tuple[str, str]]:
+    """Собирает нужное кол-во РАБОЧИХ прокси, нерабочие пропускает.
+    Проверяет пачками, максимум 5 раундов."""
+    working: list[tuple[str, str]] = []
+    for _ in range(5):
+        if len(working) >= needed:
+            break
+        still_need = needed - len(working)
+        batch      = [build_proxy_string(code) for _ in range(still_need)]
+        results    = await asyncio.gather(*[check_proxy_async(p) for p in batch])
+        for proxy_str, (alive, ip) in zip(batch, results):
+            if alive:
+                working.append((proxy_str, ip))
+    return working
 
 # ─────────────────────────────  КЛАВИАТУРЫ  ─────────────────────────────
 
@@ -308,45 +323,35 @@ async def cb_country(callback: CallbackQuery):
     label      = f"{flag} <b>{name}</b>" + (f" · {count} шт." if count > 1 else "")
 
     await callback.message.edit_text(
-        f"{label}\n\n⏳ Получаю прокси и проверяю...",
+        f"{label}\n\n⏳ Ищу рабочие прокси...",
         parse_mode="HTML"
     )
 
-    # Генерируем N прокси и проверяем их параллельно
-    proxy_list = [build_proxy_string(code) for _ in range(count)]
-    results    = await asyncio.gather(*[check_proxy_async(p) for p in proxy_list])
+    working = await collect_working_proxies(code, count)
 
-    if count == 1:
-        proxy_str      = proxy_list[0]
-        alive, real_ip = results[0]
-        host, port, user, pwd = proxy_str.split(":", 3)
-        url    = f"socks5://{user}:{pwd}@{host}:{port}"
-        status = f"✅ Живой · IP: <code>{real_ip}</code>" if alive else "⚠️ Прокси не ответил — нажми 🔄 Другой IP"
-        text   = (
-            f"{label}\n{status}\n\n"
-            f"<b>HOST:PORT:USER:PASS</b>\n<code>{proxy_str}</code>\n\n"
-            f"<b>URL</b>\n<code>{url}</code>"
+    if not working:
+        await callback.message.edit_text(
+            f"{label}\n\n⚠️ Не удалось найти рабочие прокси. Попробуй ещё раз.",
+            reply_markup=proxy_result_kb(code),
+            parse_mode="HTML"
         )
-        answer_text = "Готово ✅" if alive else "⚠️ Нет ответа"
-    else:
-        lines = [label + "\n"]
-        alive_count = 0
-        for i, (proxy_str, (alive, real_ip)) in enumerate(zip(proxy_list, results), 1):
-            host, port, user, pwd = proxy_str.split(":", 3)
-            url    = f"socks5://{user}:{pwd}@{host}:{port}"
-            status = f"✅ {real_ip}" if alive else "⚠️ нет ответа"
-            if alive:
-                alive_count += 1
-            lines.append(
-                f"<b>{i}.</b> {status}\n"
-                f"<code>{proxy_str}</code>\n"
-                f"<code>{url}</code>"
-            )
-        text        = "\n".join(lines)
-        answer_text = f"✅ Живых: {alive_count}/{count}"
+        await callback.answer("⚠️ Нет рабочих прокси")
+        return
+
+    blocks = []
+    for i, (proxy_str, ip) in enumerate(working, 1):
+        num = f"<b>{i}.</b> " if count > 1 else ""
+        blocks.append(
+            f"{num}✅ <code>{ip}</code>\n"
+            f"<code>{proxy_str}</code>"
+        )
+
+    found = len(working)
+    header = label + (f" · найдено {found}/{count}" if found < count else "")
+    text = header + "\n\n" + "\n\n".join(blocks)
 
     await callback.message.edit_text(text, reply_markup=proxy_result_kb(code), parse_mode="HTML")
-    await callback.answer(answer_text)
+    await callback.answer(f"✅ {found} шт.")
 
 
 # ── Добавить доступ ──────────────────────────────────────────────
