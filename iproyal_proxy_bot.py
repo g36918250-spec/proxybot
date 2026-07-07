@@ -67,7 +67,6 @@ def set_user_count(user_id: int, count: int) -> None:
 COUNTRIES = {
     "be": ("🇧🇪", "Бельгия"),
     "nl": ("🇳🇱", "Нидерланды"),
-    "gr": ("🇬🇷", "Греция"),
     "at": ("🇦🇹", "Австрия"),
 }
 
@@ -341,9 +340,12 @@ async def cb_country(callback: CallbackQuery):
     blocks = []
     for i, (proxy_str, ip) in enumerate(working, 1):
         num = f"<b>{i}.</b> " if count > 1 else ""
+        host, port, user, pwd = proxy_str.split(":", 3)
+        url = f"socks5://{user}:{pwd}@{host}:{port}"
         blocks.append(
             f"{num}✅ <code>{ip}</code>\n"
-            f"<code>{proxy_str}</code>"
+            f"<code>{proxy_str}</code>\n"
+            f"<code>{url}</code>"
         )
 
     found = len(working)
