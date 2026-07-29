@@ -1,10 +1,5 @@
 """
 Telegram-бот для выдачи прокси IPRoyal (residential) по странам.
-Страны: Бельгия, Нидерланды, Греция.
-
-Персистентность доступа: access.json хранится в GitHub-репозитории.
-При добавлении/удалении людей бот коммитит изменения прямо в репо.
-Нужны переменные окружения GITHUB_TOKEN и GITHUB_REPO.
 """
 
 import asyncio
@@ -30,31 +25,35 @@ from aiogram.types import (
 
 # ─────────────────────────────  НАСТРОЙКИ  ─────────────────────────────
 
-BOT_TOKEN      = os.environ["BOT_TOKEN"]
-PROXY_HOST     = "geo.iproyal.com"
-PROXY_PORT     = "32325"
-PROXY_USERNAME = os.environ["PROXY_USERNAME"]
-PROXY_PASSWORD = os.environ["PROXY_PASSWORD"]
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+PROXY_HOST       = "geo.iproyal.com"
+PROXY_PORT       = "32325"
+PROXY_USERNAME   = os.environ["PROXY_USERNAME"]
+PROXY_PASSWORD   = os.environ["PROXY_PASSWORD"]
 SESSION_LIFETIME = "1h"
 
-# GitHub — бот читает и пишет access.json прямо в репозиторий.
-# Добавь GITHUB_TOKEN и GITHUB_REPO в переменные окружения на bothost.
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO        = os.environ.get("GITHUB_REPO", "")   # g36918250-spec/proxybot
+GITHUB_REPO        = os.environ.get("GITHUB_REPO", "")
 GITHUB_BRANCH      = os.environ.get("GITHUB_BRANCH", "main")
 GITHUB_ACCESS_PATH = "access.json"
 
-# Локальный fallback (если GitHub не настроен)
 ACCESS_FILE = Path(os.environ.get("ACCESS_FILE_PATH", str(Path(__file__).with_name("access.json"))))
 
-# Админы — зашиты в код, никогда не слетают.
+# Админы — зашиты в код, никогда не слетают
 ADMIN_USERNAMES: set[str] = {
     "bepowell", "trendbee", "patumkin", "ashlieq", "luparafuck",
 }
 ADMIN_IDS: set[int] = set()
 
-# Сколько прокси выдавать — хранится в памяти, сбрасывается к 1 при перезапуске.
+# Счётчик прокси на пользователя (в памяти)
 user_proxy_count: dict[int, int] = {}
+
+# ID админов, которые уже заходили в бота (для отправки уведомлений о запросах)
+known_admin_ids: set[int] = set()
+
+# Ожидающие одобрения запросы: user_id -> {username, first_name, last_name}
+pending_requests: dict[int, dict] = {}
+
 
 def get_user_count(user_id: int) -> int:
     return user_proxy_count.get(user_id, 1)
@@ -67,6 +66,10 @@ def set_user_count(user_id: int, count: int) -> None:
 COUNTRIES = {
     "at": ("🇦🇹", "Австрия"),
     "pt": ("🇵🇹", "Португалия"),
+    "nl": ("🇳🇱", "Нидерланды"),
+    "be": ("🇧🇪", "Бельгия"),
+    "ee": ("🇪🇪", "Эстония"),
+    "lv": ("🇱🇻", "Латвия"),
 }
 
 # ─────────────────────────────  GITHUB  ─────────────────────────────
@@ -77,9 +80,7 @@ def _gh_headers() -> dict:
         "Accept": "application/vnd.github.v3+json",
     }
 
-
 def load_access() -> dict:
-    """Загружает список доступа из GitHub (приоритет) или локального файла."""
     if GITHUB_TOKEN and GITHUB_REPO:
         try:
             r = req_lib.get(
@@ -91,7 +92,6 @@ def load_access() -> dict:
                 return json.loads(content)
         except Exception as e:
             print(f"[WARN] GitHub load error: {e}")
-
     try:
         if ACCESS_FILE.exists():
             return json.loads(ACCESS_FILE.read_text(encoding="utf-8"))
@@ -99,34 +99,23 @@ def load_access() -> dict:
         pass
     return {"ids": [], "usernames": []}
 
-
 def save_access(data: dict) -> None:
-    """Сохраняет список доступа в GitHub и локально."""
-    # Локальный файл (fallback)
     try:
         ACCESS_FILE.parent.mkdir(parents=True, exist_ok=True)
         ACCESS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         print(f"[WARN] Local save error: {e}")
-
-    # GitHub — основное хранилище
     if GITHUB_TOKEN and GITHUB_REPO:
         try:
             url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_ACCESS_PATH}"
             r   = req_lib.get(url, headers=_gh_headers(), timeout=10)
             sha = r.json().get("sha") if r.status_code == 200 else None
-
             encoded = base64.b64encode(
                 json.dumps(data, ensure_ascii=False, indent=2).encode()
             ).decode()
-            payload: dict = {
-                "message": "bot: обновление доступа",
-                "content": encoded,
-                "branch":  GITHUB_BRANCH,
-            }
+            payload: dict = {"message": "bot: обновление доступа", "content": encoded, "branch": GITHUB_BRANCH}
             if sha:
                 payload["sha"] = sha
-
             result = req_lib.put(url, headers=_gh_headers(), json=payload, timeout=15)
             if result.status_code in (200, 201):
                 print("[INFO] access.json → GitHub ✓")
@@ -138,12 +127,10 @@ def save_access(data: dict) -> None:
 # ─────────────────────────────  ДОСТУП  ─────────────────────────────
 
 def is_admin(user) -> bool:
-    if user.id in ADMIN_IDS:
-        return True
-    if user.username and user.username.lower() in ADMIN_USERNAMES:
-        return True
-    return False
-
+    result = user.id in ADMIN_IDS or (user.username and user.username.lower() in ADMIN_USERNAMES)
+    if result:
+        known_admin_ids.add(user.id)  # запоминаем ID для уведомлений
+    return result
 
 def is_allowed(user) -> bool:
     if is_admin(user):
@@ -164,9 +151,7 @@ def build_proxy_string(code: str) -> str:
         password += f"_lifetime-{SESSION_LIFETIME}"
     return f"{PROXY_HOST}:{PROXY_PORT}:{PROXY_USERNAME}:{password}"
 
-
 def check_proxy(proxy_str: str) -> tuple[bool, str]:
-    """Проверяет прокси через SOCKS5. Таймаут 2 сек."""
     host, port, user, pwd = proxy_str.split(":", 3)
     proxy_url = f"socks5://{user}:{pwd}@{host}:{port}"
     proxies   = {"http": proxy_url, "https": proxy_url}
@@ -177,15 +162,11 @@ def check_proxy(proxy_str: str) -> tuple[bool, str]:
     except Exception:
         return False, ""
 
-
 async def check_proxy_async(proxy_str: str) -> tuple[bool, str]:
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, check_proxy, proxy_str)
 
-
 async def collect_working_proxies(code: str, needed: int) -> list[tuple[str, str]]:
-    """Собирает нужное кол-во РАБОЧИХ прокси, нерабочие пропускает.
-    Проверяет пачками, максимум 5 раундов."""
     working: list[tuple[str, str]] = []
     for _ in range(5):
         if len(working) >= needed:
@@ -202,19 +183,19 @@ async def collect_working_proxies(code: str, needed: int) -> list[tuple[str, str
 
 def countries_keyboard(admin: bool = False, user_id: int = 0) -> InlineKeyboardMarkup:
     count = get_user_count(user_id)
-    rows = [
+    rows  = [
         [InlineKeyboardButton(text=f"{flag} {name}", callback_data=f"country:{code}")]
         for code, (flag, name) in COUNTRIES.items()
     ]
     rows.append([InlineKeyboardButton(text=f"🔢 Количество прокси: {count}", callback_data="count_menu")])
     if admin:
         rows += [
-            [InlineKeyboardButton(text="➕ Добавить доступ", callback_data="add_access")],
-            [InlineKeyboardButton(text="➖ Убрать доступ",   callback_data="remove_access")],
-            [InlineKeyboardButton(text="👥 Список доступа",  callback_data="list_access")],
+            [InlineKeyboardButton(text="➕ Добавить доступ",  callback_data="add_access")],
+            [InlineKeyboardButton(text="➖ Убрать доступ",    callback_data="remove_access")],
+            [InlineKeyboardButton(text="🗑 Очистить всех",    callback_data="clear_access")],
+            [InlineKeyboardButton(text="👥 Список доступа",   callback_data="list_access")],
         ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def count_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -222,17 +203,36 @@ def count_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
     ])
 
-
 def cancel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✖️ Отмена", callback_data="back")]
     ])
 
-
 def proxy_result_kb(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Другой IP",        callback_data=f"country:{code}")],
-        [InlineKeyboardButton(text="⬅️ К списку стран",  callback_data="back")],
+        [InlineKeyboardButton(text="🔄 Другой IP",       callback_data=f"country:{code}")],
+        [InlineKeyboardButton(text="⬅️ К списку стран", callback_data="back")],
+    ])
+
+def confirm_clear_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить всех", callback_data="confirm_clear"),
+            InlineKeyboardButton(text="❌ Отмена",           callback_data="back"),
+        ]
+    ])
+
+def request_access_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📨 Запросить доступ", callback_data="request_access")]
+    ])
+
+def approve_deny_kb(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить",  callback_data=f"approve:{user_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny:{user_id}"),
+        ]
     ])
 
 # ─────────────────────────────  FSM  ─────────────────────────────
@@ -250,13 +250,10 @@ dp  = Dispatcher(storage=MemoryStorage())
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     if not is_allowed(message.from_user):
-        await message.answer("⛔ Доступ к боту ограничен.")
+        await message.answer("⛔ У тебя нет доступа к боту.", reply_markup=request_access_kb())
         return
     uid = message.from_user.id
-    await message.answer(
-        "Выбери страну прокси:",
-        reply_markup=countries_keyboard(is_admin(message.from_user), uid)
-    )
+    await message.answer("Выбери страну прокси:", reply_markup=countries_keyboard(is_admin(message.from_user), uid))
 
 
 @dp.message(Command("cancel"))
@@ -276,6 +273,85 @@ async def cb_back(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
+
+# ── Запрос доступа ───────────────────────────────────────────────
+
+@dp.callback_query(F.data == "request_access")
+async def cb_request_access(callback: CallbackQuery):
+    user = callback.from_user
+    if is_allowed(user):
+        await callback.answer("У тебя уже есть доступ!", show_alert=True)
+        return
+    if user.id in pending_requests:
+        await callback.answer("Запрос уже отправлен, ожидай решения.", show_alert=True)
+        return
+
+    pending_requests[user.id] = {
+        "username":   user.username or "",
+        "first_name": user.first_name or "",
+        "last_name":  user.last_name or "",
+    }
+
+    full_name = " ".join(p for p in [user.first_name or "", user.last_name or ""] if p) or "—"
+    uname     = f"@{user.username}" if user.username else "нет"
+
+    text = (
+        f"🔔 <b>Запрос доступа</b>\n\n"
+        f"Имя: {full_name}\n"
+        f"Username: {uname}\n"
+        f"ID: <code>{user.id}</code>"
+    )
+
+    sent = 0
+    for admin_id in known_admin_ids:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=approve_deny_kb(user.id))
+            sent += 1
+        except Exception:
+            pass
+
+    if sent > 0:
+        await callback.message.edit_text("📨 Запрос отправлен. Ожидай решения администратора.")
+    else:
+        await callback.message.edit_text("📨 Запрос записан. Ожидай — администратор рассмотрит его при следующем входе.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("approve:"))
+async def cb_approve(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[1])
+    data    = load_access()
+    if user_id not in data["ids"]:
+        data["ids"].append(user_id)
+        save_access(data)
+    pending_requests.pop(user_id, None)
+    await callback.message.edit_text(callback.message.text + "\n\n✅ <b>Одобрено</b>", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "✅ Тебе выдан доступ к боту! Нажми /start")
+    except Exception:
+        pass
+    await callback.answer("✅ Доступ выдан")
+
+
+@dp.callback_query(F.data.startswith("deny:"))
+async def cb_deny(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    user_id = int(callback.data.split(":")[1])
+    pending_requests.pop(user_id, None)
+    await callback.message.edit_text(callback.message.text + "\n\n❌ <b>Отклонено</b>", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "❌ В доступе отказано.")
+    except Exception:
+        pass
+    await callback.answer("❌ Отклонено")
+
+
+# ── Выбор количества ─────────────────────────────────────────────
 
 @dp.callback_query(F.data == "count_menu")
 async def cb_count_menu(callback: CallbackQuery):
@@ -304,12 +380,13 @@ async def cb_set_count(callback: CallbackQuery):
     await callback.answer(f"✅ Теперь выдаётся {count} шт.")
 
 
+# ── Страны / прокси ──────────────────────────────────────────────
+
 @dp.callback_query(F.data.startswith("country:"))
 async def cb_country(callback: CallbackQuery):
     if not is_allowed(callback.from_user):
         await callback.answer("⛔ Доступ ограничен.", show_alert=True)
         return
-
     code = callback.data.split(":", 1)[1]
     if code not in COUNTRIES:
         await callback.answer("Неизвестная страна.", show_alert=True)
@@ -320,36 +397,28 @@ async def cb_country(callback: CallbackQuery):
     flag, name = COUNTRIES[code]
     label      = f"{flag} <b>{name}</b>" + (f" · {count} шт." if count > 1 else "")
 
-    await callback.message.edit_text(
-        f"{label}\n\n⏳ Ищу рабочие прокси...",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text(f"{label}\n\n⏳ Ищу рабочие прокси...", parse_mode="HTML")
 
     working = await collect_working_proxies(code, count)
 
     if not working:
         await callback.message.edit_text(
             f"{label}\n\n⚠️ Не удалось найти рабочие прокси. Попробуй ещё раз.",
-            reply_markup=proxy_result_kb(code),
-            parse_mode="HTML"
+            reply_markup=proxy_result_kb(code), parse_mode="HTML"
         )
         await callback.answer("⚠️ Нет рабочих прокси")
         return
 
     blocks = []
     for i, (proxy_str, ip) in enumerate(working, 1):
-        num = f"<b>{i}.</b> " if count > 1 else ""
+        num  = f"<b>{i}.</b> " if count > 1 else ""
         host, port, user, pwd = proxy_str.split(":", 3)
-        url = f"socks5://{user}:{pwd}@{host}:{port}"
-        blocks.append(
-            f"{num}✅ <code>{ip}</code>\n"
-            f"<code>{proxy_str}</code>\n"
-            f"<code>{url}</code>"
-        )
+        url  = f"socks5://{user}:{pwd}@{host}:{port}"
+        blocks.append(f"{num}✅ <code>{ip}</code>\n<code>{proxy_str}</code>\n<code>{url}</code>")
 
-    found = len(working)
+    found  = len(working)
     header = label + (f" · найдено {found}/{count}" if found < count else "")
-    text = header + "\n\n" + "\n\n".join(blocks)
+    text   = header + "\n\n" + "\n\n".join(blocks)
 
     await callback.message.edit_text(text, reply_markup=proxy_result_kb(code), parse_mode="HTML")
     await callback.answer(f"✅ {found} шт.")
@@ -364,11 +433,8 @@ async def cb_add_access(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminFlow.waiting_add)
     await callback.message.edit_text(
-        "Кому дать доступ?\n"
-        "Можно сразу несколько через запятую:\n"
-        "<code>@username1, 123456789, username2</code>",
-        parse_mode="HTML",
-        reply_markup=cancel_kb()
+        "Кому дать доступ? Можно через запятую:\n<code>@username1, 123456789, username2</code>",
+        parse_mode="HTML", reply_markup=cancel_kb()
     )
     await callback.answer()
 
@@ -376,10 +442,9 @@ async def cb_add_access(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminFlow.waiting_add)
 async def msg_add_access(message: Message, state: FSMContext):
     await state.clear()
-    entries          = [e.strip().lstrip("@") for e in message.text.split(",")]
-    data             = load_access()
-    added, already   = [], []
-
+    entries        = [e.strip().lstrip("@") for e in message.text.split(",")]
+    data           = load_access()
+    added, already = [], []
     for raw in entries:
         if not raw:
             continue
@@ -397,10 +462,8 @@ async def msg_add_access(message: Message, state: FSMContext):
                 added.append(f"@{uname}")
             else:
                 already.append(f"@{uname}")
-
     if added:
         save_access(data)
-
     lines = []
     if added:
         lines.append(f"✅ Добавлены: {', '.join(added)}")
@@ -422,11 +485,8 @@ async def cb_remove_access(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(AdminFlow.waiting_remove)
     await callback.message.edit_text(
-        "Кого убрать?\n"
-        "Можно несколько через запятую:\n"
-        "<code>@username1, 123456789</code>",
-        parse_mode="HTML",
-        reply_markup=cancel_kb()
+        "Кого убрать? Можно через запятую:\n<code>@username1, 123456789</code>",
+        parse_mode="HTML", reply_markup=cancel_kb()
     )
     await callback.answer()
 
@@ -434,10 +494,9 @@ async def cb_remove_access(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminFlow.waiting_remove)
 async def msg_remove_access(message: Message, state: FSMContext):
     await state.clear()
-    entries              = [e.strip().lstrip("@") for e in message.text.split(",")]
-    data                 = load_access()
-    removed, not_found   = [], []
-
+    entries            = [e.strip().lstrip("@") for e in message.text.split(",")]
+    data               = load_access()
+    removed, not_found = [], []
     for raw in entries:
         if not raw:
             continue
@@ -455,10 +514,8 @@ async def msg_remove_access(message: Message, state: FSMContext):
                 removed.append(f"@{uname}")
             else:
                 not_found.append(f"@{uname}")
-
     if removed:
         save_access(data)
-
     lines = []
     if removed:
         lines.append(f"✅ Убраны: {', '.join(removed)}")
@@ -471,6 +528,38 @@ async def msg_remove_access(message: Message, state: FSMContext):
     )
 
 
+# ── Очистить всех ────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "clear_access")
+async def cb_clear_access(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "⚠️ Удалить доступ у <b>всех</b> пользователей?\n(Админы не затрагиваются)",
+        parse_mode="HTML", reply_markup=confirm_clear_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "confirm_clear")
+async def cb_confirm_clear(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("⛔", show_alert=True)
+        return
+    data  = load_access()
+    count = len(data.get("ids", [])) + len(data.get("usernames", []))
+    data["ids"]       = []
+    data["usernames"] = []
+    save_access(data)
+    uid = callback.from_user.id
+    await callback.message.edit_text(
+        f"🗑 Доступ удалён у {count} пользователей.",
+        reply_markup=countries_keyboard(True, uid)
+    )
+    await callback.answer("✅ Готово")
+
+
 # ── Список доступа ───────────────────────────────────────────────
 
 @dp.callback_query(F.data == "list_access")
@@ -481,8 +570,7 @@ async def cb_list_access(callback: CallbackQuery):
     data      = load_access()
     ids       = data.get("ids", [])
     usernames = data.get("usernames", [])
-
-    lines = ["👥 <b>Список доступа</b>\n"]
+    lines     = ["👥 <b>Список доступа</b>\n"]
     if ids:
         lines.append("<b>По ID:</b>")
         lines += [f"  • <code>{uid}</code>" for uid in ids]
@@ -491,7 +579,6 @@ async def cb_list_access(callback: CallbackQuery):
         lines += [f"  • @{u}" for u in usernames]
     if not ids and not usernames:
         lines.append("Список пуст.")
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")]
     ])
