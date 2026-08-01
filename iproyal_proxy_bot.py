@@ -43,7 +43,7 @@ ACCESS_FILE = Path(os.environ.get("ACCESS_FILE_PATH", str(Path(__file__).with_na
 ADMIN_USERNAMES: set[str] = {
     "bepowell", "trendbee", "patumkin", "ashlieq", "luparafuck",
 }
-ADMIN_IDS: set[int] = set()
+ADMIN_IDS: set[int] = {8118202670, 5228314475, 7213732441}
 
 # Счётчик прокси на пользователя (в памяти)
 user_proxy_count: dict[int, int] = {}
